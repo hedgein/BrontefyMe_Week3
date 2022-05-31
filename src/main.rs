@@ -7,12 +7,32 @@ use std::{ops::Deref, time::Duration};
 struct Movement {
     location: Vec3,
     velocity: Vec3,
+    accel: Vec3,
     is_left: bool,
     speed_scale: f32,
+    gravity: Vec3,
+    forces: Vec3,
 }
 
+impl Movement {
+    fn max_force(&mut self) {
+        if self.forces.y > 20.0 {
+            self.forces.y = 20.0;
+        }
+    }
+    fn apply_force(&mut self, force: f32) {
+        self.forces.y += force; 
+    }
+}
+
+#[derive(Default)]
+struct CollisionEvent;
+
 #[derive(Component)]
-struct Brick {}
+struct Floor {}
+
+#[derive(Component)]
+struct BrickShort {}
 
 #[derive(Component, PartialEq, Eq)]
 enum Collider {
@@ -27,12 +47,32 @@ fn main() {
         .add_plugin(AnimationPlugin::default())
         .add_startup_system_to_stage(StartupStage::PreStartup, setup_animations)
         .add_startup_system(initial_setup)
-        .add_system(input_handling.after("move"))
-        .add_system(movement_system.label("move"))
-        .add_system(box_collision_system.before("move"))
+        .add_event::<CollisionEvent>()
+        .add_system_set(
+            SystemSet::new()
+                .label("handle")
+                .after("move")
+                .with_system(input_handling)
+        )
+        .add_system_set(SystemSet::new().label("move").with_system(movement_system))
+        .add_system_set(
+            SystemSet::new()
+                .label("apply")
+                .before("move")
+                .with_system(apply_gravity)
+                .with_system(apply_jump)
+                .with_system(jump_handling)
+        )
+        .add_system_set(
+            SystemSet::new()
+                .label("collisions")
+                .after("apply")
+                .before("move")
+                .with_system(floor_player_collision_system.label("floor"))
+                .with_system(brick_short_collision)
+                .with_system(box_collision_system),
+        )
         .add_system(animate_sprite_system)
-        .add_system(brick_player_collision_system)
-        .add_system(brick_box_collision_system)
         .run();
 }
 
@@ -75,10 +115,13 @@ fn initial_setup(
             ..Default::default()
         })
         .insert(Movement {
-            location: Vec3::from_slice(&[-50., 0., 0.]),
+            location: Vec3::from_slice(&[100., 100., 0.]),
             velocity: Vec3::ZERO,
+            accel: Vec3::ZERO,
             is_left: false,
             speed_scale: 125.0,
+            gravity: Vec3::new(0.0, -1.5, 0.0),
+            forces: Vec3::ZERO,
         })
         .insert(anim.idle.clone())
         .insert(Play);
@@ -91,29 +134,62 @@ fn initial_setup(
         })
         .insert(Collider::Push)
         .insert(Movement {
-            velocity: Vec3::new(0.0, 0.0, 0.0),
-            location: Vec3::new(0.0, 0.0, 0.0),
+            velocity: Vec3::new(0.0, -1.0, 0.0),
+            location: Vec3::ZERO,
+            accel: Vec3::ZERO,
             is_left: false,
             speed_scale: 70.0,
+            gravity: Vec3::new(0.0, -1.5, 0.0),
+            forces: Vec3::ZERO,
         });
 
-    for n in 1..6 {
-        commands
-            .spawn_bundle(SpriteBundle {
-                sprite: Sprite {
-                    custom_size: Some(Vec2::new(1300.0 * 0.05, 1300.0 * 0.05)),
-                    ..Default::default()
-                },
-                texture: server.load("brick.png"),
-                transform: Transform {
-                    translation: Vec3::new(-200.0, -n as f32 * 65.0, 0.0),
-                    ..Default::default()
-                },
+    commands
+        .spawn_bundle(SpriteBundle {
+            sprite: Sprite {
+                custom_size: Some(Vec2::new(1280., 42.)),
                 ..Default::default()
-            })
-            .insert(Collider::Solid)
-            .insert(Brick {});
-    }
+            },
+            texture: server.load("floor_base.png"),
+            transform: Transform {
+                translation: Vec3::new(0.0, -300., 0.0),
+                ..Default::default()
+            },
+            ..Default::default()
+        })
+        .insert(Collider::Solid)
+        .insert(Floor {});
+
+    commands
+        .spawn_bundle(SpriteBundle {
+            sprite: Sprite {
+                custom_size: Some(Vec2::new(100., 42.)),
+                ..Default::default()
+            },
+            texture: server.load("floor_short.png"),
+            transform: Transform {
+                translation: Vec3::new(0.0, -200., 0.0),
+                ..Default::default()
+            },
+            ..Default::default()
+        })
+        .insert(Collider::Solid)
+        .insert(BrickShort {});
+
+    commands
+        .spawn_bundle(SpriteBundle {
+            sprite: Sprite {
+                custom_size: Some(Vec2::new(100., 42.)),
+                ..Default::default()
+            },
+            texture: server.load("floor_short.png"),
+            transform: Transform {
+                translation: Vec3::new(150.0, -100., 0.0),
+                ..Default::default()
+            },
+            ..Default::default()
+        })
+        .insert(Collider::Solid)
+        .insert(BrickShort {});
 }
 
 fn input_handling(
@@ -131,8 +207,40 @@ fn input_handling(
             KeyCode::S => Vec3::new(0.0, -1.0, 0.0),
             KeyCode::D => Vec3::new(1.0, 0.0, 0.0),
             _ => Vec3::ZERO,
+        };
+    }
+}
+
+fn jump_handling(
+    keys: Res<Input<KeyCode>>,
+    mut player_q: Query<(&Transform, &TextureAtlasSprite, &mut Movement), Without<Collider>>,
+brick_q: Query<(&Transform, &Sprite), With<BrickShort>>,
+) {
+    let (transform, sprite, mut movement) = player_q.single_mut();
+    let size = sprite.custom_size.unwrap_or(Vec2::new(41.6, 51.2));
+    for (brick_transform, brick_sprite) in brick_q.iter() {
+        let collision = collide(
+            transform.translation,
+            size,
+            brick_transform.translation,
+            brick_sprite.custom_size.unwrap_or(Vec2::ZERO),
+        );
+        let brick_offset_x = brick_sprite.custom_size.unwrap_or(Vec2::ZERO).x / 2.0;
+        let brick_offset_y = brick_sprite.custom_size.unwrap_or(Vec2::ZERO).y / 2.0;
+        let sprite_offset_y = size.y / 2.0;
+
+        if let Some(Collision::Top) = collision {
+            if keys.just_pressed(KeyCode::Space){
+                println!("jump");
+                movement.accel.y += 20.;
+            }
+        } else if brick_transform.translation.x - brick_offset_x > transform.translation.x
+            || brick_transform.translation.x + brick_offset_x < transform.translation.x
+        {
+            movement.gravity.y = -1.5;
         }
     }
+
 }
 
 fn animate_sprite_system(
@@ -163,14 +271,42 @@ fn animate_sprite_system(
     }
 }
 
-fn movement_system(mut moveable_q: Query<(&mut Movement, &mut Transform)>, time: Res<Time>) {
+fn movement_system(
+    mut moveable_q: Query<(&mut Movement, &mut Transform)>,
+    time: Res<Time>,
+) {
     for (mut movement, mut transform) in moveable_q.iter_mut() {
         if movement.velocity != Vec3::ZERO {
-            let velocity = movement.velocity.normalize();
-            let speed_scale = movement.speed_scale;
-            movement.location += velocity * speed_scale * time.delta_seconds();
+            movement.velocity = movement.velocity.normalize();
         }
+        let velocity = movement.velocity + movement.accel;
+        let speed_scale = movement.speed_scale;
+        movement.location += velocity * speed_scale * time.delta_seconds();
+
         transform.translation = movement.location;
+
+        movement.accel = Vec3::ZERO;
+    }
+}
+
+fn apply_gravity(mut moveable_q: Query<&mut Movement>,
+            ) {
+    for mut movement in moveable_q.iter_mut() {
+        let gravity = movement.gravity;
+        movement.accel += gravity;
+    }
+}
+fn apply_jump(mut moveable_q: Query<&mut Movement>,
+    keys: Res<Input<KeyCode>>,
+            ) {
+    for mut movement in moveable_q.iter_mut() {
+        if keys.pressed(KeyCode::Space) {
+                movement.apply_force(6.0);
+        }
+        movement.max_force();
+        let forces = movement.forces;
+        movement.accel += forces;
+        movement.forces = Vec3::ZERO;
     }
 }
 
@@ -227,6 +363,7 @@ fn box_collision_system(
                             movement.velocity.y = 0.0;
                         }
                     }
+                    Collision::Inside => {}
                 };
             } else {
                 player_movement.speed_scale = 155.0;
@@ -236,96 +373,69 @@ fn box_collision_system(
     }
 }
 
-fn brick_player_collision_system(
+fn floor_player_collision_system(
     mut player_q: Query<(&Transform, &TextureAtlasSprite, &mut Movement), Without<Collider>>,
-    brick_q: Query<(&Transform, &Sprite, &Collider), With<Brick>>,
+    brick_q: Query<(&Transform, &Sprite), With<Floor>>,
 ) {
     let (transform, sprite, mut movement) = player_q.single_mut();
     let size = sprite.custom_size.unwrap_or(Vec2::new(41.6, 51.2));
-    for (brick_transform, brick_sprite, collider) in brick_q.iter() {
+    for (brick_transform, brick_sprite) in brick_q.iter() {
         let collision = collide(
             transform.translation,
             size,
             brick_transform.translation,
-            brick_sprite
-                .custom_size
-                .unwrap_or(Vec2::new(1300.0 * 0.05, 1300.0 * 0.05)),
+            brick_sprite.custom_size.unwrap_or(Vec2::ZERO),
         );
-
-        if let Some(collision) = collision {
-            match collision {
-                Collision::Left => {
-                    if movement.velocity.x > 0.0 {
-                        movement.velocity.x = 0.0;
-                    } else {
-                    }
-                }
-                Collision::Right => {
-                    if movement.velocity.x < 0.0 {
-                        movement.velocity.x = 0.0;
-                    } else {
-                    }
-                }
-                Collision::Top => {
-                    if movement.velocity.y < 0.0 {
-                        movement.velocity.y = 0.0;
-                    } else {
-                    }
-                }
-                Collision::Bottom => {
-                    if movement.velocity.y > 0.0 {
-                        movement.velocity.y = 0.0;
-                    } else {
-                    }
-                }
-            }
+        let brick_offset = brick_sprite.custom_size.unwrap_or(Vec2::ZERO).x / 2.0;
+        //        println!("brick_offset = {}", brick_offset);
+        if let Some(Collision::Top) = collision {
+            movement.accel.y = 0.;
+        } else if brick_transform.translation.x - brick_offset > transform.translation.x
+            || brick_transform.translation.x + brick_offset < transform.translation.x
+        {
+            //           println!("gravity on ");
+            movement.gravity = Vec3::new(0.0, -1.5, 0.0);
         }
     }
 }
 
-fn brick_box_collision_system(
-    mut player_query: Query<(&mut Movement, &Transform, &TextureAtlasSprite), Without<Collider>>,
-    mut box_query: Query<(&mut Movement, &Transform, &Sprite), With<Collider>>,
-    brick_query: Query<(&Transform, &Sprite), With<Brick>>,
+fn brick_short_collision(
+    mut player_q: Query<(&Transform, &TextureAtlasSprite, &mut Movement), Without<Collider>>,
+    brick_q: Query<(&Transform, &Sprite), With<BrickShort>>,
+    keys: Res<Input<KeyCode>>, 
 ) {
-    let (mut player_movement, player_transform, player_sprite) = player_query.single_mut();
-    let (mut movement, transform, sprite) = box_query.single_mut();
-    let size = sprite.custom_size.unwrap_or(Vec2::new(38.0, 38.0));
-
-    for (brick_transform, brick_sprite) in brick_query.iter() {
+    let (transform, sprite, mut movement) = player_q.single_mut();
+    let size = sprite.custom_size.unwrap_or(Vec2::new(41.6, 51.2));
+    for (brick_transform, brick_sprite) in brick_q.iter() {
         let collision = collide(
             transform.translation,
             size,
             brick_transform.translation,
-            brick_sprite
-                .custom_size
-                .unwrap_or(Vec2::new(1300.0 * 0.05, 1300.0 * 0.05)),
+            brick_sprite.custom_size.unwrap_or(Vec2::ZERO),
         );
+        let brick_offset_x = brick_sprite.custom_size.unwrap_or(Vec2::ZERO).x / 2.0;
+        let brick_offset_y = brick_sprite.custom_size.unwrap_or(Vec2::ZERO).y / 2.0;
+        let sprite_offset_y = size.y / 2.0;
 
-        if let Some(collision) = collision {
-            match collision {
-                Collision::Left => {
-                    movement.velocity.x = 0.0;
-                }
-                Collision::Right => {
-                    if player_movement.velocity.x < 0.0 {
-                        movement.velocity.x = 0.0;
-                        player_movement.velocity.x = 0.0;
-                    }
-                }
-                Collision::Top => {
-                    if movement.velocity.y < 0.0 {
-                        movement.velocity.y = 0.0;
-                    } else {
-                    }
-                }
-                Collision::Bottom => {
-                    if movement.velocity.y > 0.0 {
-                        movement.velocity.y = 0.0;
-                    } else {
-                    }
-                }
-            }
+        if let Some(Collision::Top) = collision {
+            movement.accel.y = 0.;
+            
+        } else if brick_transform.translation.x - brick_offset_x > transform.translation.x
+            || brick_transform.translation.x + brick_offset_x < transform.translation.x
+        {
+            movement.gravity.y = -1.5;
         }
     }
 }
+
+/*fn collision(
+    mut collision_events: EventReader<CollisionEvent>,
+    mut player_q: Query<(&Transform, &TextureAtlasSprite, &mut Movement), Without<Collider>>,
+    ) {
+    let (_transform, _sprite, mut movement) = player_q.single_mut();
+    if collision_events.iter().count() > 0 {
+        movement.gravity.y = 0.0;
+    }
+
+}
+*/
